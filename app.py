@@ -107,21 +107,18 @@ def fetch_tax_rates():
     return out
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_yields():
-    r = requests.get(TE_URL, headers=HDR, timeout=30)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
+def parse_yield_tables(html):
+    soup = BeautifulSoup(html, "html.parser")
     rows = []
     for table in soup.find_all("table"):
         trs = table.find_all("tr")
         if not trs:
             continue
         head = [c.get_text(" ", strip=True) for c in trs[0].find_all(["th", "td"])]
-        if "Yield" not in head:
+        yi = next((i for i, h in enumerate(head) if h.lower().startswith("yield")), None)
+        if yi is None:
             continue
-        yi = head.index("Yield")
-        di = head.index("Date") if "Date" in head else None
+        di = next((i for i, h in enumerate(head) if h.lower().startswith("date")), None)
         for tr in trs[1:]:
             cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
             if len(cells) <= yi:
@@ -135,10 +132,26 @@ def fetch_yields():
                 continue
             rows.append({"Country": name, "Yield": y / 100,
                          "Date": cells[di] if di is not None and di < len(cells) else ""})
-    df = pd.DataFrame(rows)
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_yields():
+    # The /bonds page loads its tables with a second request (?partial=markets).
+    r = requests.get(TE_URL, headers=HDR, timeout=30)
+    r.raise_for_status()
+    df = parse_yield_tables(r.text)
     if df.empty:
-        raise ValueError(f"No yield table in page (HTTP {r.status_code}, {len(r.text):,} chars) - "
-                         "site may load data with JavaScript or block servers")
+        r = requests.get(TE_URL + "?partial=markets", timeout=30,
+                         headers={**HDR, "Referer": TE_URL, "X-Requested-With": "XMLHttpRequest"})
+        waf = r.headers.get("x-amzn-waf-action", "")
+        if waf or r.status_code != 200:
+            raise ValueError(f"Trading Economics requires browser verification (HTTP {r.status_code}"
+                             f"{', WAF ' + waf if waf else ''}). Enter the 10y yields manually from "
+                             "tradingeconomics.com/bonds.")
+        df = parse_yield_tables(r.text)
+    if df.empty:
+        raise ValueError("No yield table returned by Trading Economics. Enter the 10y yields manually.")
     return df.drop_duplicates("Country").reset_index(drop=True)
 
 
