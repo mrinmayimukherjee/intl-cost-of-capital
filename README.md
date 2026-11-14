@@ -8,7 +8,7 @@ A Streamlit app that compares a project's **cost of equity, cost of debt and WAC
 | U.S. industry unlevered betas | Aswath Damodaran, `betas.xls` (Unlevered beta column) |
 | Baa2/BBB spread, large non-financial firms | Aswath Damodaran, `ratings.html` |
 | Combined statutory corporate tax rates | OECD Corporate Tax Statistics (via OECD data API, dataset `DSD_TAX_CIT@DF_CIT`) |
-| 10-year government bond yields | Trading Economics, `/bonds` (scraped, no API key) |
+| 10-year government bond yields | Trading Economics country pages, e.g. `/united-states/government-bond-yield` (scraped, no API key). The `/bonds` overview table loads through a CAPTCHA-protected request, so the app reads each country's public bond page instead. |
 
 Each input shows its source, data date and fetch status. Any fetched value can be replaced with a manual input; if a fetch fails, the manual input switches on automatically.
 
