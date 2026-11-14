@@ -1,4 +1,5 @@
 import io
+import json
 import re
 from datetime import datetime, timezone
 
@@ -107,52 +108,41 @@ def fetch_tax_rates():
     return out
 
 
-def parse_yield_tables(html):
-    soup = BeautifulSoup(html, "html.parser")
-    rows = []
-    for table in soup.find_all("table"):
-        trs = table.find_all("tr")
-        if not trs:
-            continue
-        head = [c.get_text(" ", strip=True) for c in trs[0].find_all(["th", "td"])]
-        yi = next((i for i, h in enumerate(head) if h.lower().startswith("yield")), None)
-        if yi is None:
-            continue
-        di = next((i for i, h in enumerate(head) if h.lower().startswith("date")), None)
-        for tr in trs[1:]:
-            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
-            if len(cells) <= yi:
-                continue
-            name = next((c for c in cells[:yi] if c), "")   # skip empty flag cell
-            name = re.sub(r"\s*\d+Y$", "", name)
-            name = {"US": "United States", "UK": "United Kingdom"}.get(name, name)
-            try:
-                y = float(cells[yi].replace(",", ""))
-            except ValueError:
-                continue
-            rows.append({"Country": name, "Yield": y / 100,
-                         "Date": cells[di] if di is not None and di < len(cells) else ""})
-    return pd.DataFrame(rows)
+# OECD name -> Trading Economics URL slug (others: lowercase, spaces -> hyphens)
+TE_SLUGS = {"Korea": "south-korea", "Türkiye": "turkey", "Czechia": "czech-republic",
+            "Slovak Republic": "slovakia", "China (People's Republic of)": "china",
+            "Hong Kong, China": "hong-kong", "Viet Nam": "vietnam", "Chinese Taipei": "taiwan",
+            "Russian Federation": "russia"}
+
+
+def te_url(country):
+    slug = TE_SLUGS.get(country) or re.sub(r"[^a-z0-9]+", "-", country.lower()).strip("-")
+    return f"https://tradingeconomics.com/{slug}/government-bond-yield"
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_yields():
-    # The /bonds page loads its tables with a second request (?partial=markets).
-    r = requests.get(TE_URL, headers=HDR, timeout=30)
-    r.raise_for_status()
-    df = parse_yield_tables(r.text)
-    if df.empty:
-        r = requests.get(TE_URL + "?partial=markets", timeout=30,
-                         headers={**HDR, "Referer": TE_URL, "X-Requested-With": "XMLHttpRequest"})
-        waf = r.headers.get("x-amzn-waf-action", "")
-        if waf or r.status_code != 200:
-            raise ValueError(f"Trading Economics requires browser verification (HTTP {r.status_code}"
-                             f"{', WAF ' + waf if waf else ''}). Enter the 10y yields manually from "
-                             "tradingeconomics.com/bonds.")
-        df = parse_yield_tables(r.text)
-    if df.empty:
-        raise ValueError("No yield table returned by Trading Economics. Enter the 10y yields manually.")
-    return df.drop_duplicates("Country").reset_index(drop=True)
+def fetch_yield(country):
+    """Read the 10y yield embedded in the country's public bond page (TEChartsMeta)."""
+    url = te_url(country)
+    r = requests.get(url, headers=HDR, timeout=30)
+    waf = r.headers.get("x-amzn-waf-action", "")
+    if waf or r.status_code != 200:
+        raise ValueError(f"{country}: Trading Economics returned HTTP {r.status_code}"
+                         f"{' (WAF ' + waf + ')' if waf else ''}. Enter the yield manually.")
+    m = re.search(r"TEChartsMeta\s*=\s*(\[.*?\]);", r.text, re.S)
+    if not m:
+        raise ValueError(f"{country}: no yield data found on {url}. Enter the yield manually.")
+    try:
+        meta = json.loads(m.group(1))[0]
+        value = float(meta["value"])
+    except Exception:
+        v = re.search(r'"value"\s*:\s*(-?[0-9.]+)', m.group(1))
+        if not v:
+            raise ValueError(f"{country}: could not read the yield value. Enter it manually.")
+        meta, value = {}, float(v.group(1))
+    date = next((str(meta[k]) for k in ("last_update", "lastUpdate", "date", "LastUpdate") if meta.get(k)),
+                datetime.now(timezone.utc).strftime("%Y-%m-%d (fetched)"))
+    return value / 100, date, meta.get("symbol", "")
 
 
 def safe(fn):
@@ -202,7 +192,6 @@ with st.spinner("Fetching latest data..."):
     betas_res, betas_err = safe(fetch_betas)
     spread_res, spread_err = safe(fetch_bbb_spread)
     taxes, tax_err = safe(fetch_tax_rates)
-    yields, yld_err = safe(fetch_yields)
 fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 betas, beta_date = betas_res if betas_res else (None, None)
 spread_auto, spread_date = spread_res if spread_res else (None, None)
@@ -212,8 +201,8 @@ st.sidebar.header("Project settings")
 industries = list(betas["Industry"]) if betas is not None else [DEFAULT_INDUSTRY]
 industry = st.sidebar.selectbox("Industry", industries,
                                 index=industries.index(DEFAULT_INDUSTRY) if DEFAULT_INDUSTRY in industries else 0)
-countries = sorted(set(yields["Country"]) if yields is not None else
-                   set(taxes["Country"]) if taxes is not None else set()) or ["United States"]
+countries = sorted(taxes["Country"]) if taxes is not None else ["United States", "Germany", "Japan",
+                                                                  "United Kingdom", "Colombia", "Brazil", "India"]
 if "United States" not in countries:
     countries = ["United States"] + countries
 country = st.sidebar.selectbox("Target country", countries, index=countries.index("United States"))
@@ -229,14 +218,13 @@ tax_fc_f, tax_fc_yr = lookup_tax(taxes, country)
 
 
 def y_of(c):
-    if yields is None:
-        return None, None
-    hit = yields[yields["Country"] == c]
-    return (float(hit["Yield"].iloc[0]), hit["Date"].iloc[0]) if len(hit) else (None, None)
+    res, err = safe(lambda: fetch_yield(c))
+    return (res[0], res[1], err) if res else (None, None, err)
 
 
-rf_us_f, rf_us_date = y_of("United States")
-rf_fc_f, rf_fc_date = y_of(country)
+rf_us_f, rf_us_date, yld_err_us = y_of("United States")
+rf_fc_f, rf_fc_date, yld_err_fc = y_of(country) if country != "United States" else (rf_us_f, rf_us_date, yld_err_us)
+yld_err = "; ".join(dict.fromkeys(e for e in (yld_err_us, yld_err_fc) if e)) or None
 
 st.sidebar.header("Manual overrides")
 
@@ -311,8 +299,8 @@ src = pd.DataFrame([
     ["Baa2/BBB spread, large non-financial firms (Damodaran)", status(spread_err, ov_spr), spread_date, SPREAD_URLS[0]],
     ["Combined statutory CIT rate, U.S. (OECD)", status(tax_err or (tax_us_f is None), ov_tus), tax_us_yr, TAX_PAGE],
     [f"Combined statutory CIT rate, {country} (OECD)", status(tax_err or (tax_fc_f is None), ov_tfc), tax_fc_yr, TAX_PAGE],
-    ["U.S. 10y government yield (Trading Economics)", status(yld_err or (rf_us_f is None), ov_rus), rf_us_date, TE_URL],
-    [f"{country} 10y government yield (Trading Economics)", status(yld_err or (rf_fc_f is None), ov_rfc), rf_fc_date, TE_URL],
+    ["U.S. 10y government yield (Trading Economics)", status(yld_err_us or (rf_us_f is None), ov_rus), rf_us_date, te_url("United States")],
+    [f"{country} 10y government yield (Trading Economics)", status(yld_err_fc or (rf_fc_f is None), ov_rfc), rf_fc_date, te_url(country)],
 ], columns=["Input", "Status", "Data as of", "Source"])
 src["Data as of"] = src["Data as of"].map(lambda v: "n/a" if v is None or (isinstance(v, float) and v != v) else str(v))
 st.dataframe(src[["Input", "Status", "Data as of", "Source"]], hide_index=True, width="stretch",
