@@ -274,17 +274,21 @@ st.table(df.apply(fmt, axis=1))
 
 # ---------------- Sources ----------------
 st.subheader("Data sources")
+def status(err, ov):
+    if err and ov:
+        return "Fetch failed - manual input"
+    return "Manual override" if ov else "Fetched"
+
+
 src = pd.DataFrame([
-    ["Unlevered beta (Damodaran, U.S. industries)", BETA_URL, beta_date, betas_err, ov_beta],
-    ["Baa2/BBB spread, large non-financial firms (Damodaran)", SPREAD_URLS[0], spread_date, spread_err, ov_spr],
-    ["Combined statutory CIT rate, U.S. (OECD)", TAX_PAGE, tax_us_yr, tax_err, ov_tus],
-    [f"Combined statutory CIT rate, {country} (OECD)", TAX_PAGE, tax_fc_yr, tax_err, ov_tfc],
-    ["U.S. 10y government yield (Trading Economics)", TE_URL, rf_us_date, yld_err, ov_rus],
-    [f"{country} 10y government yield (Trading Economics)", TE_URL, rf_fc_date, yld_err, ov_rfc],
-], columns=["Input", "Source", "Data as of", "Fetch error", "Manual override"])
-src["Data as of"] = src["Data as of"].map(lambda v: "n/a" if v is None else str(v))
-src["Status"] = src.apply(lambda r: "Manual" if r["Manual override"] else ("Error" if r["Fetch error"] else "Fetched"),
-                          axis=1)
+    ["Unlevered beta (Damodaran, U.S. industries)", status(betas_err, ov_beta), beta_date, BETA_URL],
+    ["Baa2/BBB spread, large non-financial firms (Damodaran)", status(spread_err, ov_spr), spread_date, SPREAD_URLS[0]],
+    ["Combined statutory CIT rate, U.S. (OECD)", status(tax_err or (tax_us_f is None), ov_tus), tax_us_yr, TAX_PAGE],
+    [f"Combined statutory CIT rate, {country} (OECD)", status(tax_err or (tax_fc_f is None), ov_tfc), tax_fc_yr, TAX_PAGE],
+    ["U.S. 10y government yield (Trading Economics)", status(yld_err or (rf_us_f is None), ov_rus), rf_us_date, TE_URL],
+    [f"{country} 10y government yield (Trading Economics)", status(yld_err or (rf_fc_f is None), ov_rfc), rf_fc_date, TE_URL],
+], columns=["Input", "Status", "Data as of", "Source"])
+src["Data as of"] = src["Data as of"].map(lambda v: "n/a" if v is None or (isinstance(v, float) and v != v) else str(v))
 st.dataframe(src[["Input", "Status", "Data as of", "Source"]], hide_index=True, width="stretch",
              column_config={"Source": st.column_config.LinkColumn()})
 st.caption(f"Last fetch: {fetched_at}. OECD rates pulled via the OECD data API (dataset DSD_TAX_CIT@DF_CIT).")
