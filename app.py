@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import pandas as pd
 import requests
 import streamlit as st
+from bs4 import BeautifulSoup
 
 st.set_page_config(page_title="International Cost of Capital", layout="wide")
 st.title("International Cost of Capital: USD vs Foreign Currency")
@@ -72,11 +73,11 @@ def fetch_bbb_spread():
             r.raise_for_status()
             # First table on the page = large non-financial service firms
             for t in pd.read_html(io.StringIO(r.text)):
-                s = t.astype(str)
-                mask = s.apply(lambda c: c.str.contains("Baa2/BBB", regex=False)).any(axis=1)
-                if not mask.any():
+                cells = [["" if pd.isna(v) else str(v) for v in row] for row in t.values.tolist()]
+                hits = [row for row in cells if any("Baa2/BBB" in v for v in row)]
+                if not hits:
                     continue
-                row = s[mask].iloc[0].tolist()
+                row = hits[0]
                 nums = [float(x) for v in row for x in re.findall(r"-?\d+\.?\d*", v.replace("%", ""))]
                 val = nums[-1]
                 val = val / 100 if val > 0.2 else val  # "1.11%" -> 0.0111
@@ -110,23 +111,35 @@ def fetch_tax_rates():
 def fetch_yields():
     r = requests.get(TE_URL, headers=HDR, timeout=30)
     r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
     rows = []
-    for t in pd.read_html(io.StringIO(r.text)):
-        ycol = next((c for c in t.columns if "yield" in str(c).lower()), None)
-        if ycol is None:
+    for table in soup.find_all("table"):
+        trs = table.find_all("tr")
+        if not trs:
             continue
-        dcol = next((c for c in t.columns if str(c).strip().lower() == "date"), None)
-        for _, row in t.iterrows():
-            name = re.sub(r"\s*\d+Y$", "", str(row.iloc[0]).strip())
-            name = ALIASES.get(name, name) if name in ("US", "UK") else name
-            y = pd.to_numeric(row[ycol], errors="coerce")
-            if pd.notna(y):
-                rows.append({"Country": name, "Yield": y / 100,
-                             "Date": str(row[dcol]) if dcol is not None else ""})
-    df = pd.DataFrame(rows).drop_duplicates("Country").reset_index(drop=True)
+        head = [c.get_text(" ", strip=True) for c in trs[0].find_all(["th", "td"])]
+        if "Yield" not in head:
+            continue
+        yi = head.index("Yield")
+        di = head.index("Date") if "Date" in head else None
+        for tr in trs[1:]:
+            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+            if len(cells) <= yi:
+                continue
+            name = next((c for c in cells[:yi] if c), "")   # skip empty flag cell
+            name = re.sub(r"\s*\d+Y$", "", name)
+            name = {"US": "United States", "UK": "United Kingdom"}.get(name, name)
+            try:
+                y = float(cells[yi].replace(",", ""))
+            except ValueError:
+                continue
+            rows.append({"Country": name, "Yield": y / 100,
+                         "Date": cells[di] if di is not None and di < len(cells) else ""})
+    df = pd.DataFrame(rows)
     if df.empty:
-        raise ValueError("No yield table found (site may have blocked the request)")
-    return df
+        raise ValueError(f"No yield table in page (HTTP {r.status_code}, {len(r.text):,} chars) - "
+                         "site may load data with JavaScript or block servers")
+    return df.drop_duplicates("Country").reset_index(drop=True)
 
 
 def safe(fn):
